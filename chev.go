@@ -6,18 +6,86 @@ import (
 )
 
 var (
-	lock      = sync.RWMutex{}
-	listeners = make(map[string][]chan any)
+	lock = sync.RWMutex{}
+	m    = make(map[string][]*Listener)
 )
 
-func Listen[T any]() <-chan T {
-	name := fmt.Sprintf("%T", *new(T))
+type Flag int
 
-	c := make(chan any)
+const (
+	FlagReset Flag = 0
+	FlagOnce  Flag = 1 << iota
+)
+
+type Handler[T any] func(t T)
+type Listener struct {
+	flags Flag
+	event string
+	f     Handler[any]
+	in    chan any
+}
+
+func NewListener(event string, f Handler[any]) *Listener {
+	l := &Listener{
+		event: event,
+		f:     f,
+		flags: FlagReset,
+		in:    make(chan any),
+	}
+
+	go func() {
+		for t := range l.in {
+			switch {
+			case l.IsOnce():
+				l.f(t)
+				Off(l)
+				return
+			default:
+				l.f(t)
+			}
+		}
+	}()
+
+	return l
+}
+
+func (l *Listener) Once() *Listener {
+	l.flags |= FlagOnce
+	return l
+}
+
+func (l *Listener) IsOnce() bool {
+	return l.flags&FlagOnce != 0
+}
+
+func Off(l *Listener) {
 	lock.Lock()
-	listeners[name] = append(listeners[name], c)
-	lock.Unlock()
-	return wrap[T](c)
+	defer lock.Unlock()
+	for i, listener := range m[l.event] {
+		if listener == l {
+			m[l.event] = append(m[l.event][:i], m[l.event][i+1:]...)
+			close(l.in)
+			break
+		}
+	}
+}
+
+func On[T any](f Handler[T]) *Listener {
+	name := fmt.Sprintf("%T", *new(T))
+	h := NewListener(name, wrap(f))
+	lock.Lock()
+	defer lock.Unlock()
+	m[name] = append(m[name], h)
+	return h
+}
+
+func Once[T any](f Handler[T]) *Listener {
+	name := fmt.Sprintf("%T", *new(T))
+	h := NewListener(name, wrap(f)).Once()
+	lock.Lock()
+	defer lock.Unlock()
+	m[name] = append(m[name], h)
+	return h
 }
 
 func Send[T any](t T) {
@@ -25,26 +93,17 @@ func Send[T any](t T) {
 
 	lock.RLock()
 	defer lock.RUnlock()
-	for _, c := range listeners[name] {
-		go func(c chan any) { c <- t }(c)
+
+	for _, l := range m[name] {
+		go func(l *Listener) {
+			defer kalm()
+			l.in <- t
+		}(l)
 	}
 }
 
-func Close() {
-	for _, cs := range listeners {
-		for _, c := range cs {
-			close(c)
-		}
-	}
+func wrap[T any](f Handler[T]) Handler[any] {
+	return func(t any) { f(t.(T)) }
 }
 
-func wrap[T any](in chan any) chan T {
-	out := make(chan T)
-	go func() {
-		defer close(out)
-		for v := range in {
-			out <- v.(T)
-		}
-	}()
-	return out
-}
+func kalm() { _ = recover() }
